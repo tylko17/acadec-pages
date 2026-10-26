@@ -1,0 +1,84 @@
+rules_version = '2';
+
+// Access model, in one place:
+//   * Everyone signs in anonymously. That alone opens nothing.
+//   * Presenting the team code creates members/{uid}. The rule compares it to
+//     private/secrets, which no client can read, so the code is never shipped
+//     to the browser and changing it in the console locks every device out.
+//   * Cards (deck/*) are Resource Guide text: members only, never public.
+//   * The captain code works the same way, via captains/{uid}.
+service cloud.firestore {
+  match /databases/{db}/documents {
+    function secrets() { return get(/databases/$(db)/documents/private/secrets).data; }
+    function signedIn() { return request.auth != null; }
+    function member() {
+      return signedIn()
+        && exists(/databases/$(db)/documents/members/$(request.auth.uid))
+        && get(/databases/$(db)/documents/members/$(request.auth.uid)).data.code.lower() == secrets().teamCode.lower();
+    }
+    function captain() {
+      return member()
+        && exists(/databases/$(db)/documents/captains/$(request.auth.uid))
+        && get(/databases/$(db)/documents/captains/$(request.auth.uid)).data.code.lower() == secrets().captainCode.lower();
+    }
+
+    match /private/{doc} { allow read, write: if false; }
+
+    match /members/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow create, update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['code'])
+        && request.resource.data.code is string
+        && request.resource.data.code.lower() == secrets().teamCode.lower();
+    }
+    match /captains/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow create, update: if member() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['code'])
+        && request.resource.data.code is string
+        && request.resource.data.code.lower() == secrets().captainCode.lower();
+    }
+
+    match /config/{doc} {
+      allow read: if member();
+      allow write: if captain();
+    }
+
+    // Card text. Written only by scripts/seed.mjs (the admin SDK bypasses rules).
+    match /deck/{doc} {
+      allow read: if member();
+      allow write: if false;
+    }
+
+    match /students/{id} {
+      allow read: if member();
+      allow create, delete: if captain();
+      // A member may take a name (uid becomes theirs), release their own, and
+      // publish their own numbers. Names, divisions and the captain flag are captain-only.
+      allow update: if captain() || (member()
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['uid', 'claimedAt', 'total', 'subjects', 'improvement', 'reviews', 'lastReview', 'days'])
+        && (request.resource.data.uid == request.auth.uid || resource.data.uid == request.auth.uid)
+        && (!('total' in request.resource.data) || (request.resource.data.total is number
+              && request.resource.data.total >= 0 && request.resource.data.total <= 10000)));
+    }
+
+    // One doc per student per subject: { studentId, subject, c: { cardId: [numbers] } }.
+    // Only the device bound to that student may write it.
+    match /progress/{pid} {
+      allow read: if member();
+      allow create, update: if member()
+        && request.resource.data.studentId == pid.split('_')[0]
+        && get(/databases/$(db)/documents/students/$(pid.split('_')[0])).data.uid == request.auth.uid;
+      allow delete: if captain();
+    }
+
+    match /events/{id} {
+      allow read: if member();
+      allow create: if member()
+        && request.resource.data.keys().hasOnly(['ts', 'kind', 'studentId', 'name', 'text'])
+        && request.resource.data.text is string && request.resource.data.text.size() < 300;
+      allow delete: if captain();
+    }
+  }
+}
